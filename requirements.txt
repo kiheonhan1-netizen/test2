@@ -2,3 +2,6 @@ streamlit>=1.67,<2
 openai>=3.2,<4
 python-dotenv>=1.0
 Pillow>=12.0
+# 4.x에만 얼굴 검출용 Haar cascade 파일이 포함되어 있다 (5.0부터 제외됨)
+opencv-python-headless>=4.9,<5
+numpy>=1.26

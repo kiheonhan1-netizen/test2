@@ -9,14 +9,28 @@ import logging
 import os
 import re
 import threading
+from functools import lru_cache
 
+import numpy as np
 import openai
 import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-from prompts import MULTI_FACE_MESSAGE, NO_FACE_MESSAGE, SYSTEM_PROMPT, USER_PROMPT
+try:  # 얼굴 영역 자르기용. 없으면 사진 전체를 그대로 보낸다.
+    import cv2
+except ImportError:  # pragma: no cover
+    cv2 = None
+
+from prompts import (
+    MULTI_FACE_MESSAGE,
+    NO_FACE_MESSAGE,
+    REQUIRED_SECTION,
+    RETRY_PROMPT,
+    SYSTEM_PROMPT,
+    USER_PROMPT,
+)
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -27,6 +41,11 @@ DISCLAIMER = "⚠️ 재미로 보는 결과이며 과학적 근거가 없습니
 ALLOWED_TYPES = ["jpg", "jpeg", "png", "webp"]
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10MB
 MAX_IMAGE_SIDE = 1024
+WORK_IMAGE_SIDE = 2048  # 얼굴을 찾고 자를 때 쓰는 해상도 (자른 뒤 MAX_IMAGE_SIDE로 줄인다)
+# 얼굴 검출 상자(대략 눈썹~턱) 기준으로 이마·머리, 귀, 턱이 보이도록 넓히는 비율
+FACE_MARGIN_TOP, FACE_MARGIN_SIDE, FACE_MARGIN_BOTTOM = 0.45, 0.35, 0.3
+# 두 번째로 큰 얼굴이 가장 큰 얼굴 면적의 이 비율 이상이면 '여러 명'으로 보고 자르지 않는다.
+MULTI_FACE_AREA_RATIO = 0.5
 # 4천만 화소(예: 8000x5000)까지만 허용한다. 일반 휴대폰 사진은 충분히 들어가고,
 # 파일은 작지만 해상도만 거대한 이미지(압축 폭탄)로 서버 메모리가 터지는 것을 막는다.
 MAX_IMAGE_PIXELS = 40_000_000
@@ -137,6 +156,45 @@ def release_analysis() -> None:
 # ---------------------------------------------------------------------------
 # 이미지 처리
 # ---------------------------------------------------------------------------
+@lru_cache(maxsize=1)
+def _face_detector():
+    """OpenCV 기본 정면 얼굴 검출기(Haar cascade). 사용할 수 없으면 None."""
+    if cv2 is None:
+        return None
+    detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    return None if detector.empty() else detector
+
+
+def crop_to_face(img: Image.Image) -> Image.Image:
+    """사진에서 가장 큰 얼굴 주변만 잘라 낸다.
+
+    관상 풀이에 필요한 얼굴에 집중하고, 명찰·로고·배경처럼 인물을 짐작하게 하는 요소를 빼서
+    AI가 신원 문제로 풀이를 거절하는 일을 줄인다. 얼굴을 못 찾았거나 비슷한 크기의 얼굴이
+    여럿이면 원본을 그대로 반환한다(여러 명 판단은 AI에게 맡긴다).
+    """
+    detector = _face_detector()
+    if detector is None:
+        return img
+    try:
+        gray = cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2GRAY)
+        min_side = max(40, min(img.size) // 12)
+        faces = detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=6, minSize=(min_side, min_side))
+    except Exception:  # 검출 실패는 치명적이지 않으므로 원본으로 진행
+        logger.exception("얼굴 검출 실패")
+        return img
+    if len(faces) == 0:
+        return img
+    faces = sorted(faces, key=lambda f: int(f[2]) * int(f[3]), reverse=True)
+    x, y, w, h = (int(v) for v in faces[0])
+    if len(faces) > 1 and faces[1][2] * faces[1][3] >= MULTI_FACE_AREA_RATIO * w * h:
+        return img
+    left = max(0, int(x - w * FACE_MARGIN_SIDE))
+    top = max(0, int(y - h * FACE_MARGIN_TOP))
+    right = min(img.width, int(x + w * (1 + FACE_MARGIN_SIDE)))
+    bottom = min(img.height, int(y + h * (1 + FACE_MARGIN_BOTTOM)))
+    return img.crop((left, top, right, bottom))
+
+
 def preprocess_image(image_bytes: bytes) -> bytes:
     """이미지를 검증하고 회전 보정·RGB 변환·리사이즈한 JPEG 바이트를 반환한다.
 
@@ -148,7 +206,7 @@ def preprocess_image(image_bytes: bytes) -> bytes:
             width, height = img.size
             if width * height > MAX_IMAGE_PIXELS:
                 raise AnalysisError(TOO_BIG_IMAGE_MESSAGE)
-            img.draft("RGB", (MAX_IMAGE_SIDE, MAX_IMAGE_SIDE))  # JPEG는 디코딩 단계에서 축소해 메모리 절약
+            img.draft("RGB", (WORK_IMAGE_SIDE, WORK_IMAGE_SIDE))  # JPEG는 디코딩 단계에서 축소해 메모리 절약
             img = ImageOps.exif_transpose(img)
             if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
                 # 투명 배경은 흰색으로 채운다.
@@ -158,6 +216,8 @@ def preprocess_image(image_bytes: bytes) -> bytes:
                 img = background
             elif img.mode != "RGB":
                 img = img.convert("RGB")
+            img.thumbnail((WORK_IMAGE_SIDE, WORK_IMAGE_SIDE))
+            img = crop_to_face(img)
             img.thumbnail((MAX_IMAGE_SIDE, MAX_IMAGE_SIDE))
             buffer = io.BytesIO()
             img.save(buffer, format="JPEG", quality=85)
@@ -194,14 +254,39 @@ def get_processed_image(image_bytes: bytes, image_hash: str) -> tuple[bytes | No
 # ---------------------------------------------------------------------------
 # OpenAI 분석
 # ---------------------------------------------------------------------------
+def is_valid_reading(content: str) -> bool:
+    """정해진 형식의 관상 풀이이거나, 약속된 재업로드 안내 문구인지 확인한다."""
+    return content.startswith((NO_FACE_MESSAGE, MULTI_FACE_MESSAGE)) or REQUIRED_SECTION in content
+
+
+def strip_preamble(content: str) -> str:
+    """풀이 앞에 붙은 사과·서두 문장("죄송하지만 ...")을 첫 Markdown 제목 앞에서 잘라낸다."""
+    match = re.search(r"^\s*#{1,6}\s", content, re.MULTILINE)
+    return content[match.start():].strip() if match else content
+
+
 @st.cache_data(show_spinner=False, max_entries=100, ttl=60 * 60)
 def analyze_face(image_b64: str, model: str, _api_key: str) -> str:
     """OpenAI 비전 모델로 관상을 분석해 Markdown 텍스트를 반환한다.
 
-    같은 이미지·모델 조합은 캐시된 결과를 재사용한다(_api_key는 캐시 키에서 제외).
-    예외가 발생하면 캐시되지 않는다.
+    모델이 형식을 벗어난 거절("누구인지 알 수 없다" 등)을 하면 한 번 더 요청하고,
+    그래도 안 되면 AnalysisError를 낸다. 같은 이미지·모델 조합은 캐시된 결과를 재사용한다
+    (_api_key는 캐시 키에서 제외). 예외가 발생하면 캐시되지 않는다.
     """
     client = OpenAI(api_key=_api_key, timeout=REQUEST_TIMEOUT_SEC, max_retries=1)
+    content = ""
+    for attempt, user_text in enumerate((USER_PROMPT, RETRY_PROMPT), start=1):
+        content = _request_reading(client, model, image_b64, user_text)
+        if content and is_valid_reading(content):
+            return strip_preamble(content)
+        logger.warning("형식을 벗어난 응답 (시도 %d): %s", attempt, content[:200])
+    raise AnalysisError(
+        "AI가 이 사진의 관상 풀이를 거절했습니다. 얼굴이 정면으로 크게 나온 다른 사진으로 시도해주세요."
+    )
+
+
+def _request_reading(client: OpenAI, model: str, image_b64: str, user_text: str) -> str:
+    """OpenAI에 1회 요청해 응답 텍스트를 반환한다. 거절·빈 응답이면 빈 문자열을 반환한다."""
     try:
         response = client.chat.completions.create(
             model=model,
@@ -210,7 +295,7 @@ def analyze_face(image_b64: str, model: str, _api_key: str) -> str:
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": USER_PROMPT},
+                        {"type": "text", "text": user_text},
                         {
                             "type": "image_url",
                             "image_url": {"url": f"data:image/jpeg;base64,{image_b64}", "detail": "high"},
@@ -244,15 +329,14 @@ def analyze_face(image_b64: str, model: str, _api_key: str) -> str:
 
     if not response.choices:
         logger.warning("응답에 choices가 없음")
-        raise AnalysisError("AI가 결과를 만들지 못했습니다. 다시 시도해주세요.")
+        return ""
     message = response.choices[0].message
     if getattr(message, "refusal", None):
         logger.warning("모델이 분석을 거절함: %s", message.refusal)
-        raise AnalysisError("AI가 이 사진의 분석을 거절했습니다. 얼굴이 잘 보이는 다른 사진으로 시도해주세요.")
+        return ""
     content = (message.content or "").strip()
     if not content:
         logger.warning("빈 응답 (finish_reason=%s)", response.choices[0].finish_reason)
-        raise AnalysisError("AI가 결과를 만들지 못했습니다. 다시 시도해주세요.")
     return content
 
 
@@ -464,7 +548,7 @@ def main() -> None:
             st.error(error)
         else:
             with st.container(key="preview", horizontal_alignment="center"):
-                st.image(processed, caption="업로드한 사진", width=350)
+                st.image(processed, caption="분석에 사용할 얼굴 영역", width=350)
 
     if st.button("🔍 관상 보기", type="primary", disabled=processed is None, width="stretch"):
         if image_hash not in results:
