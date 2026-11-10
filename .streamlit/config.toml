@@ -1,0 +1,25 @@
+# AI 관상가 테마 - 먹색 · 한지색 · 금색
+[theme]
+font = "Noto Sans KR:https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&display=swap, sans-serif"
+headingFont = "Gowun Batang:https://fonts.googleapis.com/css2?family=Gowun+Batang:wght@400;700&display=swap, serif"
+baseRadius = "0.75rem"
+
+# 라이트 모드: 한지 바탕에 먹색 글씨, 짙은 금색 포인트
+[theme.light]
+primaryColor = "#9A6B1F"
+backgroundColor = "#F8F3E6"
+secondaryBackgroundColor = "#EFE6D0"
+textColor = "#2B2620"
+borderColor = "#DCCFAF"
+
+# 다크 모드: 먹색 바탕에 한지색 글씨, 금색 포인트
+[theme.dark]
+primaryColor = "#B8862B"
+backgroundColor = "#16140F"
+secondaryBackgroundColor = "#24201A"
+textColor = "#EDE5D3"
+borderColor = "#3D362A"
+
+[server]
+# 업로더 안내 문구와 서버 측 제한을 앱의 10MB 정책에 맞춘다.
+maxUploadSize = 10
